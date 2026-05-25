@@ -4,7 +4,7 @@ websockets==12.0
 yfinance==0.2.40
 pandas
 pandas-ta
-numpy==1.24.3
+numpy
 torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
 joblib==1.4.2
 # Auth
