@@ -2,9 +2,9 @@ fastapi==0.111.0
 uvicorn[standard]==0.29.0
 websockets==12.0
 yfinance==0.2.40
-pandas>=2.1.0,<2.2
+pandas==2.0.3
 pandas_ta
-numpy==1.26.4
+numpy==1.24.3
 torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
 joblib==1.4.2
 # Auth
