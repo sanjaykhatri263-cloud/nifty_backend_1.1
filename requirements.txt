@@ -2,15 +2,12 @@ fastapi==0.111.0
 uvicorn[standard]==0.29.0
 websockets==12.0
 yfinance==0.2.40
-pandas
-pandas-ta
-numpy
-bcrypt==3.2.2
-torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
+pandas==2.2.2
+pandas-ta==0.3.14b
+numpy==1.26.4
+torch==2.3.0
 joblib==1.4.2
-scikit-learn
-# Auth
 passlib[bcrypt]==1.7.4
 python-jose[cryptography]==3.3.0
-# Optional: ICICI Direct Breeze (uncomment when using Breeze source)
-# breeze-connect==1.0.73
+requests==2.31.0
+breeze-connect==1.0.73
