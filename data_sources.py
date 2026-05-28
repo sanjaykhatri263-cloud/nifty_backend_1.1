@@ -38,8 +38,7 @@ class YFinanceSource(DataSource):
             import requests, yfinance as yf
             session = requests.Session()
             session.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
             })
             ticker = yf.Ticker(self.TICKER, session=session)
             raw    = ticker.history(period="1d", interval="1m", auto_adjust=True)
@@ -99,8 +98,9 @@ class BreezeSource(DataSource):
             self.creds.connected = True
             self.creds.error     = ""
             log.info("Breeze connected ✓")
-        except ImportError:
-            self.creds.error     = "breeze-connect not installed. Add to requirements.txt"
+        except ImportError as e:
+            # THIS IS THE FIX: Reveals the true underlying library crash
+            self.creds.error     = f"Breeze Library Crash: {e}"
             self.creds.connected = False
             log.error(self.creds.error)
         except Exception as e:
@@ -120,7 +120,7 @@ class BreezeSource(DataSource):
 
             log.info(f"Breeze fetching NIFTY cash from {start} to {end}")
 
-            # ✅ CORRECT params for Nifty 50 index — confirmed from official SDK
+            # CORRECT params for Nifty 50 index — confirmed from official SDK
             resp = self._breeze.get_historical_data_v2(
                 interval="1minute",
                 from_date=start,
