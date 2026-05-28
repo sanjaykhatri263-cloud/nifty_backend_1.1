@@ -112,9 +112,8 @@ class BreezeSource(DataSource):
             log.error(f"Breeze not connected: {self.creds.error}")
             return None
         try:
-            # FORCE INDIA STANDARD TIME (IST) FOR THE CLOUD SERVER
-            # ICICI SDK strictly requires the time values to be IST, but formatted with a 'Z'
-            now   = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            # FIX: Pure UTC time! ICICI will handle the timezone translation.
+            now   = datetime.utcnow()
             
             # Fetch last 2 hours of 1-min bars
             start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -182,8 +181,8 @@ class BreezeSource(DataSource):
         if not self.creds.connected or self._breeze is None:
             return {"ok": False, "error": self.creds.error}
         try:
-            # Fetch just 5 minutes of data as a test
-            now   = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            # FIX: Pure UTC time!
+            now   = datetime.utcnow()
             start = (now - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             resp  = self._breeze.get_historical_data_v2(
