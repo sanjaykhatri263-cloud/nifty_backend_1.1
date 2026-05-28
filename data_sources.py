@@ -113,8 +113,24 @@ class BreezeSource(DataSource):
             log.error(f"Breeze not connected: {self.creds.error}")
             return None
         try:
-            # FORCE INDIA STANDARD TIME (IST) FOR THE CLOUD SERVER
-            now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            # Revert to pure UTC - ICICI automatically translates the 'Z' to IST!
+            now   = datetime.utcnow()
+            
+            # Fetch last 2 hours of 1-min bars
+            start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+            log.info(f"Breeze fetching NIFTY cash from {start} to {end}")
+
+            # CORRECT params for Nifty 50 index
+            resp = self._breeze.get_historical_data_v2(
+                interval="1minute",
+                from_date=start,
+                to_date=end,
+                stock_code="NIFTY",       # UPPERCASE is safer for ICICI
+                exchange_code="NSE",
+                product_type="cash",
+            )
             
             # Fetch last 2 hours of 1-min bars
             start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
