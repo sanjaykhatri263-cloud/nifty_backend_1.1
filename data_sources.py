@@ -1,7 +1,7 @@
 """
 data_sources.py — Fixed Breeze connection for Nifty 50 index cash data
 Correct params confirmed from official Breeze SDK GitHub:
-  stock_code="nifty", exchange_code="nse", product_type="cash"
+  stock_code="NIFTY", exchange_code="NSE", product_type="cash"
 """
 
 import logging
@@ -99,7 +99,6 @@ class BreezeSource(DataSource):
             self.creds.error     = ""
             log.info("Breeze connected ✓")
         except ImportError as e:
-            # THIS IS THE FIX: Reveals the true underlying library crash
             self.creds.error     = f"Breeze Library Crash: {e}"
             self.creds.connected = False
             log.error(self.creds.error)
@@ -113,8 +112,9 @@ class BreezeSource(DataSource):
             log.error(f"Breeze not connected: {self.creds.error}")
             return None
         try:
-            # Revert to pure UTC - ICICI automatically translates the 'Z' to IST!
-            now   = datetime.utcnow()
+            # FORCE INDIA STANDARD TIME (IST) FOR THE CLOUD SERVER
+            # ICICI SDK strictly requires the time values to be IST, but formatted with a 'Z'
+            now   = datetime.utcnow() + timedelta(hours=5, minutes=30)
             
             # Fetch last 2 hours of 1-min bars
             start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -122,38 +122,14 @@ class BreezeSource(DataSource):
 
             log.info(f"Breeze fetching NIFTY cash from {start} to {end}")
 
-            # CORRECT params for Nifty 50 index
+            # CORRECT params for Nifty 50 index (Strictly Uppercase)
             resp = self._breeze.get_historical_data_v2(
                 interval="1minute",
                 from_date=start,
                 to_date=end,
-                stock_code="NIFTY",       # UPPERCASE is safer for ICICI
+                stock_code="NIFTY",       
                 exchange_code="NSE",
                 product_type="cash",
-            )
-            
-            # Fetch last 2 hours of 1-min bars
-            start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
- 
-            
-            # Fetch last 2 hours of 1-min bars
-            start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            # Fetch last 2 hours of 1-min bars
-            start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-            log.info(f"Breeze fetching NIFTY cash from {start} to {end}")
-
-            # CORRECT params for Nifty 50 index — confirmed from official SDK
-            resp = self._breeze.get_historical_data_v2(
-                interval="1minute",
-                from_date=start,
-                to_date=end,
-                stock_code="nifty",       # lowercase works
-                exchange_code="nse",      # NSE cash segment for index
-                product_type="cash",      # cash = index spot
             )
 
             log.info(f"Breeze raw response status: {resp.get('Status') if resp else 'None'}")
@@ -207,15 +183,15 @@ class BreezeSource(DataSource):
             return {"ok": False, "error": self.creds.error}
         try:
             # Fetch just 5 minutes of data as a test
-            now   = datetime.now()
+            now   = datetime.utcnow() + timedelta(hours=5, minutes=30)
             start = (now - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             resp  = self._breeze.get_historical_data_v2(
                 interval="1minute",
                 from_date=start,
                 to_date=end,
-                stock_code="nifty",
-                exchange_code="nse",
+                stock_code="NIFTY",
+                exchange_code="NSE",
                 product_type="cash",
             )
             return {
