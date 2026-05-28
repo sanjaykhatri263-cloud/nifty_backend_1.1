@@ -113,7 +113,17 @@ class BreezeSource(DataSource):
             log.error(f"Breeze not connected: {self.creds.error}")
             return None
         try:
-            now   = datetime.now()
+            # FORCE INDIA STANDARD TIME (IST) FOR THE CLOUD SERVER
+            now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            
+            # Fetch last 2 hours of 1-min bars
+            start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+ 
+            
+            # Fetch last 2 hours of 1-min bars
+            start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             # Fetch last 2 hours of 1-min bars
             start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
