@@ -1,7 +1,6 @@
 """
 data_sources.py — Fixed Breeze connection for Nifty 50 index cash data
-Correct params confirmed from official Breeze SDK GitHub:
-  stock_code="NIFTY", exchange_code="NSE", product_type="cash"
+Supports dynamic historical fetching (days) and live ticking (minutes).
 """
 
 import logging
@@ -19,7 +18,7 @@ class DataSource(ABC):
     name: str = "base"
 
     @abstractmethod
-    def fetch_1m_ohlc(self) -> Optional[pd.DataFrame]:
+    def fetch_1m_ohlc(self, days: int = 0, minutes: int = 120) -> Optional[pd.DataFrame]:
         ...
 
     @property
@@ -33,7 +32,7 @@ class YFinanceSource(DataSource):
     name = "yfinance"
     TICKER = "^NSEI"
 
-    def fetch_1m_ohlc(self) -> Optional[pd.DataFrame]:
+    def fetch_1m_ohlc(self, days: int = 0, minutes: int = 120) -> Optional[pd.DataFrame]:
         try:
             import requests, yfinance as yf
             session = requests.Session()
@@ -41,7 +40,11 @@ class YFinanceSource(DataSource):
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
             })
             ticker = yf.Ticker(self.TICKER, session=session)
-            raw    = ticker.history(period="1d", interval="1m", auto_adjust=True)
+            
+            # yfinance uses strict periods. If days > 0 use 5d/1mo, else use 1d
+            period = "1mo" if days > 5 else "5d" if days > 0 else "1d"
+            raw    = ticker.history(period=period, interval="1m", auto_adjust=True)
+            
             if raw is None or raw.empty or len(raw) < 5:
                 log.warning("yfinance: too few bars")
                 return None
@@ -50,7 +53,7 @@ class YFinanceSource(DataSource):
             raw.index = (raw.index.tz_localize(None)
                          if raw.index.tzinfo is None
                          else raw.index.tz_convert(None))
-            log.info(f"yfinance OK: {len(raw)} bars")
+            log.info(f"yfinance OK: {len(raw)} bars fetched")
             return raw
         except Exception as e:
             log.warning(f"yfinance failed: {e}")
@@ -68,7 +71,7 @@ class YFinanceSource(DataSource):
         }
 
 
-# ── ICICI Direct Breeze (FIXED — correct Nifty 50 cash params) ───────────────
+# ── ICICI Direct Breeze ──────────────────────────────────────────────────────
 @dataclass
 class BreezeCredentials:
     api_key:       str
@@ -107,21 +110,23 @@ class BreezeSource(DataSource):
             self.creds.connected = False
             log.error(f"Breeze connect failed: {e}")
 
-    def fetch_1m_ohlc(self) -> Optional[pd.DataFrame]:
+    def fetch_1m_ohlc(self, days: int = 0, minutes: int = 120) -> Optional[pd.DataFrame]:
         if not self.creds.connected or self._breeze is None:
             log.error(f"Breeze not connected: {self.creds.error}")
             return None
         try:
-            # FIX: Pure UTC time! ICICI will handle the timezone translation.
-            now   = datetime.utcnow()
+            now = datetime.utcnow()
             
-            # Fetch last 2 hours of 1-min bars
-            start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            # Dynamic Time Strategy (Pure UTC)
+            if days > 0:
+                start = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            else:
+                start = (now - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                
+            end = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-            log.info(f"Breeze fetching NIFTY cash from {start} to {end}")
+            log.info(f"Breeze fetching NIFTY from {start} to {end}")
 
-            # CORRECT params for Nifty 50 index (Strictly Uppercase)
             resp = self._breeze.get_historical_data_v2(
                 interval="1minute",
                 from_date=start,
@@ -131,14 +136,8 @@ class BreezeSource(DataSource):
                 product_type="cash",
             )
 
-            log.info(f"Breeze raw response status: {resp.get('Status') if resp else 'None'}")
-
-            if not resp:
-                log.error("Breeze: empty response")
-                return None
-
-            if resp.get("Status") != 200:
-                log.error(f"Breeze error: {resp.get('Error')} | {resp}")
+            if not resp or resp.get("Status") != 200:
+                log.error(f"Breeze error: {resp.get('Error') if resp else 'Empty'}")
                 return None
 
             records = resp.get("Success", [])
@@ -146,12 +145,7 @@ class BreezeSource(DataSource):
                 log.warning("Breeze: Status 200 but no records — market may be closed")
                 return None
 
-            log.info(f"Breeze: got {len(records)} raw records")
-
             df = pd.DataFrame(records)
-            log.info(f"Breeze columns: {list(df.columns)}")
-
-            # Handle column names from Breeze response
             df = df.rename(columns={
                 "datetime": "Datetime",
                 "open":     "Open",
@@ -160,7 +154,6 @@ class BreezeSource(DataSource):
                 "close":    "Close",
             })
 
-            # Keep only what we need
             df["Datetime"] = pd.to_datetime(df["Datetime"])
             df = df.set_index("Datetime")[["Open","High","Low","Close"]].sort_index()
             df = df.astype(float)
@@ -169,19 +162,17 @@ class BreezeSource(DataSource):
                         else df.index)
             df = df.dropna()
 
-            log.info(f"Breeze OK: {len(df)} 1m bars | latest: {df.index[-1]} close={df['Close'].iloc[-1]:.2f}")
+            log.info(f"Breeze OK: {len(df)} bars fetched | latest: {df.index[-1]}")
             return df
 
         except Exception as e:
-            log.error(f"Breeze fetch_1m_ohlc error: {e}", exc_info=True)
+            log.error(f"Breeze fetch error: {e}", exc_info=True)
             return None
 
     def test_connection(self) -> dict:
-        """Quick connectivity test — call this to diagnose issues."""
         if not self.creds.connected or self._breeze is None:
             return {"ok": False, "error": self.creds.error}
         try:
-            # FIX: Pure UTC time!
             now   = datetime.utcnow()
             start = (now - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -222,8 +213,8 @@ class DataSourceManager:
     def __init__(self):
         self._source: DataSource = YFinanceSource()
 
-    def fetch_1m_ohlc(self) -> Optional[pd.DataFrame]:
-        return self._source.fetch_1m_ohlc()
+    def fetch_1m_ohlc(self, days: int = 0, minutes: int = 120) -> Optional[pd.DataFrame]:
+        return self._source.fetch_1m_ohlc(days, minutes)
 
     @property
     def status(self) -> dict:
