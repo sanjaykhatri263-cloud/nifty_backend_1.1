@@ -3,7 +3,7 @@ uvicorn[standard]==0.29.0
 websockets==12.0
 yfinance==0.2.40
 pandas==2.2.2
-https://github.com/twopirllc/pandas-ta/archive/main.zip
+https://github.com/twopirllc/pandas-ta/archive/master.zip
 numpy==1.26.4
 torch==2.3.0
 joblib==1.4.2
