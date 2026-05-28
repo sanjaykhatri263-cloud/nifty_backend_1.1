@@ -7,7 +7,8 @@ pandas-ta
 numpy
 torch
 joblib
-passlib[bcrypt]
+passlib
+bcrypt==3.2.2
 python-jose[cryptography]
 requests
 breeze-connect
