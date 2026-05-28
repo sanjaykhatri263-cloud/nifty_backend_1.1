@@ -1,12 +1,10 @@
 """
 Nifty Sniper — Live Signal Backend  v2
 =======================================
-New in v2:
-  • JWT auth (admin + subscriber roles)
-  • Subscriber management (add / suspend / delete via admin API)
-  • Pluggable data source: yfinance ↔ ICICI Direct Breeze (switch at runtime)
-  • WebSocket auth via token query param: ws://host/ws?token=<JWT>
-  • Admin REST endpoints for data source config + subscriber management
+New in v2: 
+  • Stateful Memory Appending (Protects ICICI limits)
+  • 10-Day Indicator Warm-up on Boot
+  • Historical signals endpoint for dashboard backtesting
 """
 
 import asyncio
@@ -14,7 +12,7 @@ import json
 import logging
 import os
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -53,7 +51,7 @@ INPUT_DIM   = 70
 D_MODEL     = 128
 N_HEAD      = 4
 NUM_LAYERS  = 3
-LONG_THRESH = 0.80   # default 80% as per your preference
+LONG_THRESH = 0.80   
 SHORT_THRESH= 0.80
 POLL_SECS   = 60
 
@@ -130,20 +128,27 @@ def generate_blueprint_features(df_dict: dict) -> pd.DataFrame:
 # ── Engine ────────────────────────────────────────────────────────────────────
 class NiftySignalEngine:
     def __init__(self):
-        self.device       = torch.device("cpu")
-        self.scaler       = joblib.load(SCALER_PATH)
-        self.long_brain   = self._load(LONG_PATH)
-        self.short_brain  = self._load(SHORT_PATH)
+        self.device        = torch.device("cpu")
+        self.scaler        = joblib.load(SCALER_PATH)
+        self.long_brain    = self._load(LONG_PATH)
+        self.short_brain   = self._load(SHORT_PATH)
         self.signal_history: deque = deque(maxlen=200)
         self.latest_signal: dict   = {}
         self.long_thresh   = LONG_THRESH
         self.short_thresh  = SHORT_THRESH
         self.data_mgr      = DataSourceManager()
+        
+        # Persistent Memory to protect API limits
+        self.memory_df: Optional[pd.DataFrame] = None
+        
+        # We'll also store the raw AI predictions in a dataframe for the history endpoint
+        self.historical_predictions: pd.DataFrame = pd.DataFrame()
+        
         log.info("Engine ready ✓")
 
     def _load(self, path):
         m = NiftySniperBrain()
-        m.load_state_dict(torch.load(path, map_location=self.device))
+        m.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
         m.eval()
         return m
 
@@ -159,9 +164,27 @@ class NiftySignalEngine:
                 "short_thresh_pct": round(self.short_thresh * 100)}
 
     def run_inference(self) -> Optional[dict]:
-        df_1m = self.data_mgr.fetch_1m_ohlc()
-        if df_1m is None:
-            return None
+        # 1. Stateful Data Fetching Logic (10 Days on boot, 15 Mins thereafter)
+        if self.memory_df is None or self.memory_df.empty:
+            log.info("Engine waking up: Fetching 10 days of history to warm up 60m indicators...")
+            new_df = self.data_mgr.fetch_1m_ohlc(days=10, minutes=0)
+            if new_df is None: return None
+            self.memory_df = new_df
+        else:
+            log.info("Engine active: Fetching last 15 minutes of live ticks...")
+            new_df = self.data_mgr.fetch_1m_ohlc(days=0, minutes=15)
+            if new_df is None: return None
+            
+            # Append, remove duplicates, and sort
+            merged = pd.concat([self.memory_df, new_df])
+            merged = merged[~merged.index.duplicated(keep='last')].sort_index()
+            
+            # Keep memory capped at 4000 rows (roughly 10 trading days)
+            self.memory_df = merged.tail(4000)
+
+        # Work on a copy of the memory
+        df_1m = self.memory_df.copy()
+        
         freq_map = {"1m":"1min","2m":"2min","5m":"5min","15m":"15min","60m":"60min"}
         df_dict  = {
             tf: df_1m.resample(freq).agg(
@@ -169,21 +192,33 @@ class NiftySignalEngine:
             ).dropna()
             for tf, freq in freq_map.items()
         }
+        
         if len(df_dict["2m"]) < SEQ_LEN + 5:
-            log.warning("Not enough 2m bars")
+            log.warning("Not enough 2m bars after resample")
             return None
+            
         fm = generate_blueprint_features(df_dict).dropna()
         if len(fm) < SEQ_LEN:
             return None
+            
         win    = fm.iloc[-SEQ_LEN:].values.astype(np.float32)
         scaled = self.scaler.transform(win)
         x      = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0)
+        
         with torch.no_grad():
             pl = float(self.long_brain(x).item())
             ps = float(self.short_brain(x).item())
+            
         signal = self._decide(pl, ps)
         price  = float(df_dict["2m"]["Close"].iloc[-1])
         bar    = df_dict["2m"].index[-1]
+        
+        # Save prediction into memory for the historical endpoint
+        if bar not in self.historical_predictions.index:
+            new_pred = pd.DataFrame({"Close": price, "Long_Prob": pl, "Short_Prob": ps}, index=[bar])
+            self.historical_predictions = pd.concat([self.historical_predictions, new_pred])
+            self.historical_predictions = self.historical_predictions.tail(1000) # Keep last ~2 days of signals
+            
         result = {
             "timestamp":        datetime.now(timezone.utc).isoformat(),
             "bar_time":         str(bar),
@@ -198,6 +233,7 @@ class NiftySignalEngine:
             "ma_bull_2m":       int(fm["2m_MA_Bull"].iloc[-1]),
             "data_source":      self.data_mgr.current_source,
         }
+        
         self.signal_history.appendleft(result)
         self.latest_signal = result
         log.info(f"{signal}  long={pl:.1%}  short={ps:.1%}  ₹{price:.2f}  src={self.data_mgr.current_source}")
@@ -293,7 +329,7 @@ async def reset_password(username: str, body: PasswordReset, admin: dict = Depen
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Admin — data source management
+# Admin — data source management & History
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/admin/data-source")
 async def get_data_source(admin: dict = Depends(require_admin)):
@@ -318,6 +354,11 @@ async def switch_data_source(body: DataSourceSwitch, admin: dict = Depends(requi
         )
     else:
         raise HTTPException(status_code=400, detail="source must be 'yfinance' or 'breeze'")
+        
+    # Clear the engine memory so it fetches a clean 10-day history from the new source
+    engine.memory_df = None
+    engine.historical_predictions = pd.DataFrame()
+    
     await broadcast({"type": "data_source_changed", "data": status})
     return status
 
@@ -333,6 +374,39 @@ async def admin_stats(admin: dict = Depends(require_admin)):
             "short": round(engine.short_thresh * 100),
         },
     }
+
+@app.get("/admin/history")
+async def get_historical_signals(days_back: int = 1, admin: dict = Depends(require_admin)):
+    """
+    Returns historical price action and AI probabilities so the frontend 
+    can display yesterday's action and simulated signals.
+    """
+    df = engine.historical_predictions
+    if df is None or df.empty:
+        raise HTTPException(status_code=400, detail="Engine memory is empty or still warming up.")
+    
+    try:
+        # Filter for only standard market hours (09:15 to 15:30)
+        df = df.between_time('09:15', '15:30')
+        
+        if days_back > 0:
+            last_date = df.index[-1].date()
+            start_date = last_date - timedelta(days=days_back)
+            df = df.loc[str(start_date):]
+
+        history_list = []
+        for index, row in df.iterrows():
+            history_list.append({
+                "time": index.strftime("%Y-%m-%d %H:%M:%S"),
+                "close": round(row.get("Close", 0), 2),
+                "long_prob": round(row.get("Long_Prob", 0) * 100, 1),
+                "short_prob": round(row.get("Short_Prob", 0) * 100, 1)
+            })
+            
+        return {"status": "ok", "records": len(history_list), "data": history_list}
+    except Exception as e:
+        log.error(f"Failed to generate history: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process historical data")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
