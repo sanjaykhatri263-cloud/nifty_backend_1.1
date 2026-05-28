@@ -207,7 +207,7 @@ class NiftySignalEngine:
         # 1. Stateful Data Fetching Logic (10 Days on boot, 15 Mins thereafter)
         if self.memory_df is None or self.memory_df.empty:
             log.info("Engine waking up: Fetching 10 days of history to warm up 60m indicators...")
-            new_df = self.data_mgr.fetch_1m_ohlc(days=10, minutes=0)
+            new_df = self.data_mgr.fetch_1m_ohlc(days=15, minutes=0)
             if new_df is None: return None
             self.memory_df = new_df
             
