@@ -2,9 +2,9 @@
 Nifty Sniper — Live Signal Backend  v2
 =======================================
 New in v2: 
-  • Stateful Memory Appending (Protects ICICI limits)
-  • 10-Day Indicator Warm-up on Boot
-  • Historical signals endpoint for dashboard backtesting
+  • Stateful Memory Appending
+  • 10-Day Warmup
+  • Full OHLC Historical Storage for Advanced 1:3 RR Frontend Backtesting
 """
 
 import asyncio
@@ -35,17 +35,14 @@ from auth import (
 )
 from data_sources import DataSourceManager
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("nifty")
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
 BASE        = Path(__file__).parent
 SCALER_PATH = BASE / "models" / "nifty_scaler_dual_V2.pkl"
 LONG_PATH   = BASE / "models" / "long_brain_10bar_V2.pth"
 SHORT_PATH  = BASE / "models" / "short_brain_10bar_V2.pth"
 
-# ── Hyperparams ───────────────────────────────────────────────────────────────
 SEQ_LEN     = 10
 INPUT_DIM   = 70
 D_MODEL     = 128
@@ -55,7 +52,6 @@ LONG_THRESH = 0.80
 SHORT_THRESH= 0.80
 POLL_SECS   = 60
 
-# ── Model ─────────────────────────────────────────────────────────────────────
 class NiftySniperBrain(nn.Module):
     def __init__(self):
         super().__init__()
@@ -72,8 +68,6 @@ class NiftySniperBrain(nn.Module):
     def forward(self, x):
         return self.fc(self.transformer(self.proj(x))[:, -1, :]).squeeze(-1)
 
-
-# ── Features ──────────────────────────────────────────────────────────────────
 def generate_blueprint_features(df_dict: dict) -> pd.DataFrame:
     master_df = df_dict["2m"][["Open", "High", "Low", "Close"]].copy()
     feature_matrix = pd.DataFrame(index=master_df.index)
@@ -125,7 +119,6 @@ def generate_blueprint_features(df_dict: dict) -> pd.DataFrame:
     return feature_matrix.ffill().bfill()
 
 
-# ── Engine ────────────────────────────────────────────────────────────────────
 class NiftySignalEngine:
     def __init__(self):
         self.device        = torch.device("cpu")
@@ -138,12 +131,8 @@ class NiftySignalEngine:
         self.short_thresh  = SHORT_THRESH
         self.data_mgr      = DataSourceManager()
         
-        # Persistent Memory to protect API limits
         self.memory_df: Optional[pd.DataFrame] = None
-        
-        # We'll also store the raw AI predictions in a dataframe for the history endpoint
         self.historical_predictions: pd.DataFrame = pd.DataFrame()
-        
         log.info("Engine ready ✓")
 
     def _load(self, path):
@@ -163,26 +152,8 @@ class NiftySignalEngine:
                 "long_thresh_pct":  round(self.long_thresh  * 100),
                 "short_thresh_pct": round(self.short_thresh * 100)}
 
-    def run_inference(self) -> Optional[dict]:
-        # 1. Stateful Data Fetching Logic (10 Days on boot, 15 Mins thereafter)
-        if self.memory_df is None or self.memory_df.empty:
-            log.info("Engine waking up: Fetching 10 days of history to warm up 60m indicators...")
-            new_df = self.data_mgr.fetch_1m_ohlc(days=10, minutes=0)
-            if new_df is None: return None
-            self.memory_df = new_df
-        else:
-            log.info("Engine active: Fetching last 15 minutes of live ticks...")
-            new_df = self.data_mgr.fetch_1m_ohlc(days=0, minutes=15)
-            if new_df is None: return None
-            
-            # Append, remove duplicates, and sort
-            merged = pd.concat([self.memory_df, new_df])
-            merged = merged[~merged.index.duplicated(keep='last')].sort_index()
-            
-            # Keep memory capped at 4000 rows (roughly 10 trading days)
-            self.memory_df = merged.tail(4000)
-
-        # Work on a copy of the memory
+    def _warmup_and_backtest(self):
+        log.info("Generating historical backtest signals for dashboard...")
         df_1m = self.memory_df.copy()
         
         freq_map = {"1m":"1min","2m":"2min","5m":"5min","15m":"15min","60m":"60min"}
@@ -193,13 +164,67 @@ class NiftySignalEngine:
             for tf, freq in freq_map.items()
         }
         
-        if len(df_dict["2m"]) < SEQ_LEN + 5:
-            log.warning("Not enough 2m bars after resample")
-            return None
+        if len(df_dict["2m"]) < SEQ_LEN + 5: return
+        
+        fm = generate_blueprint_features(df_dict).dropna()
+        if len(fm) < SEQ_LEN: return
+        
+        records = []
+        for i in range(SEQ_LEN, len(fm) + 1):
+            win = fm.iloc[i-SEQ_LEN:i].values.astype(np.float32)
+            scaled = self.scaler.transform(win)
+            x = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0)
+            
+            with torch.no_grad():
+                pl = float(self.long_brain(x).item())
+                ps = float(self.short_brain(x).item())
+            
+            bar_time = fm.index[i-1]
+            
+            # SAVING FULL OHLC FOR BACKTESTING
+            records.append(pd.DataFrame({
+                "Open": float(df_dict["2m"].loc[bar_time, "Open"]),
+                "High": float(df_dict["2m"].loc[bar_time, "High"]),
+                "Low": float(df_dict["2m"].loc[bar_time, "Low"]),
+                "Close": float(df_dict["2m"].loc[bar_time, "Close"]), 
+                "Long_Prob": pl, 
+                "Short_Prob": ps
+            }, index=[bar_time]))
+        
+        if records:
+            self.historical_predictions = pd.concat(records)
+            log.info(f"Backtest ready! {len(self.historical_predictions)} historical signals computed.")
+
+    def run_inference(self) -> Optional[dict]:
+        if self.memory_df is None or self.memory_df.empty:
+            log.info("Engine waking up: Fetching 10 days of history to warm up 60m indicators...")
+            new_df = self.data_mgr.fetch_1m_ohlc(days=10, minutes=0)
+            if new_df is None: return None
+            self.memory_df = new_df
+            self._warmup_and_backtest()
+        else:
+            log.info("Engine active: Fetching last 15 minutes of live ticks...")
+            new_df = self.data_mgr.fetch_1m_ohlc(days=0, minutes=15)
+            if new_df is None: return None
+            
+            merged = pd.concat([self.memory_df, new_df])
+            merged = merged[~merged.index.duplicated(keep='last')].sort_index()
+            self.memory_df = merged.tail(4000)
+
+        df_1m = self.memory_df.copy()
+        
+        freq_map = {"1m":"1min","2m":"2min","5m":"5min","15m":"15min","60m":"60min"}
+        df_dict  = {
+            tf: df_1m.resample(freq).agg(
+                {"Open":"first","High":"max","Low":"min","Close":"last"}
+            ).dropna()
+            for tf, freq in freq_map.items()
+        }
+        
+        if len(df_dict["2m"]) < SEQ_LEN + 5: return None
             
         fm = generate_blueprint_features(df_dict).dropna()
-        if len(fm) < SEQ_LEN:
-            return None
+        if len(fm) < SEQ_LEN: return None
             
         win    = fm.iloc[-SEQ_LEN:].values.astype(np.float32)
         scaled = self.scaler.transform(win)
@@ -213,11 +238,20 @@ class NiftySignalEngine:
         price  = float(df_dict["2m"]["Close"].iloc[-1])
         bar    = df_dict["2m"].index[-1]
         
-        # Save prediction into memory for the historical endpoint
-        if bar not in self.historical_predictions.index:
-            new_pred = pd.DataFrame({"Close": price, "Long_Prob": pl, "Short_Prob": ps}, index=[bar])
-            self.historical_predictions = pd.concat([self.historical_predictions, new_pred])
-            self.historical_predictions = self.historical_predictions.tail(1000) # Keep last ~2 days of signals
+        if self.historical_predictions.empty or bar not in self.historical_predictions.index:
+            new_pred = pd.DataFrame({
+                "Open": float(df_dict["2m"].loc[bar_time, "Open"]),
+                "High": float(df_dict["2m"].loc[bar_time, "High"]),
+                "Low": float(df_dict["2m"].loc[bar_time, "Low"]),
+                "Close": price, 
+                "Long_Prob": pl, 
+                "Short_Prob": ps
+            }, index=[bar])
+            if self.historical_predictions.empty:
+                self.historical_predictions = new_pred
+            else:
+                self.historical_predictions = pd.concat([self.historical_predictions, new_pred])
+            self.historical_predictions = self.historical_predictions.tail(2000) 
             
         result = {
             "timestamp":        datetime.now(timezone.utc).isoformat(),
@@ -240,65 +274,43 @@ class NiftySignalEngine:
         return result
 
 
-# ── FastAPI ───────────────────────────────────────────────────────────────────
 app    = FastAPI(title="Nifty Sniper API v2")
 engine = NiftySignalEngine()
-
-# connected WebSockets keyed by username (allow multiple tabs per user)
-clients: dict[str, set[WebSocket]] = {}   # username → {ws, ...}
+clients: dict[str, set[WebSocket]] = {}   
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
 
 async def broadcast(payload: dict):
     msg  = json.dumps(payload)
     dead: list[tuple[str, WebSocket]] = []
     for uname, wset in clients.items():
         for ws in list(wset):
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                dead.append((uname, ws))
-    for uname, ws in dead:
-        clients.get(uname, set()).discard(ws)
-
+            try: await ws.send_text(msg)
+            except Exception: dead.append((uname, ws))
+    for uname, ws in dead: clients.get(uname, set()).discard(ws)
 
 async def inference_loop():
     while True:
         result = await asyncio.get_event_loop().run_in_executor(None, engine.run_inference)
-        if result:
-            await broadcast({"type": "signal", "data": result})
+        if result: await broadcast({"type": "signal", "data": result})
         await asyncio.sleep(POLL_SECS)
-
 
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(inference_loop())
     log.info("Inference loop started")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Auth endpoints
-# ══════════════════════════════════════════════════════════════════════════════
 @app.post("/auth/token", response_model=Token)
 async def login(form: OAuth2PasswordRequestForm = Depends()):
     user = authenticate_user(form.username, form.password)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials or account suspended")
+    if not user: raise HTTPException(status_code=401, detail="Invalid credentials or account suspended")
     token = create_token({"sub": user["username"], "role": user["role"]})
-    return Token(
-        access_token=token, token_type="bearer",
-        role=user["role"], username=user["username"], name=user["name"]
-    )
+    return Token(access_token=token, token_type="bearer", role=user["role"], username=user["username"], name=user["name"])
 
 @app.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
     return {k: v for k, v in user.items() if k != "hashed_pw"}
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Admin — subscriber management
-# ══════════════════════════════════════════════════════════════════════════════
 @app.get("/admin/subscribers", response_model=list[UserOut])
 async def get_subscribers(admin: dict = Depends(require_admin)):
     return list_subscribers()
@@ -307,8 +319,7 @@ async def get_subscribers(admin: dict = Depends(require_admin)):
 async def create_subscriber(data: UserIn, admin: dict = Depends(require_admin)):
     return add_subscriber(data)
 
-class StatusUpdate(BaseModel):
-    status: str   # "active" | "suspended"
+class StatusUpdate(BaseModel): status: str   
 
 @app.patch("/admin/subscribers/{username}", response_model=UserOut)
 async def patch_subscriber(username: str, body: StatusUpdate, admin: dict = Depends(require_admin)):
@@ -319,46 +330,34 @@ async def remove_subscriber(username: str, admin: dict = Depends(require_admin))
     delete_subscriber(username)
     return {"deleted": username}
 
-class PasswordReset(BaseModel):
-    new_password: str
+class PasswordReset(BaseModel): new_password: str
 
 @app.post("/admin/subscribers/{username}/reset-password")
 async def reset_password(username: str, body: PasswordReset, admin: dict = Depends(require_admin)):
     change_password(username, body.new_password)
     return {"ok": True}
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Admin — data source management & History
-# ══════════════════════════════════════════════════════════════════════════════
 @app.get("/admin/data-source")
 async def get_data_source(admin: dict = Depends(require_admin)):
     return engine.data_mgr.status
 
 class DataSourceSwitch(BaseModel):
-    source:        str            # "yfinance" | "breeze"
+    source:        str            
     api_key:       Optional[str] = None
     api_secret:    Optional[str] = None
     session_token: Optional[str] = None
 
 @app.post("/admin/data-source")
 async def switch_data_source(body: DataSourceSwitch, admin: dict = Depends(require_admin)):
-    if body.source == "yfinance":
-        status = engine.data_mgr.switch_to_yfinance()
+    if body.source == "yfinance": status = engine.data_mgr.switch_to_yfinance()
     elif body.source == "breeze":
         if not all([body.api_key, body.api_secret, body.session_token]):
-            raise HTTPException(status_code=400,
-                detail="api_key, api_secret, and session_token are required for Breeze")
-        status = engine.data_mgr.switch_to_breeze(
-            body.api_key, body.api_secret, body.session_token
-        )
-    else:
-        raise HTTPException(status_code=400, detail="source must be 'yfinance' or 'breeze'")
+            raise HTTPException(status_code=400, detail="Missing Breeze config")
+        status = engine.data_mgr.switch_to_breeze(body.api_key, body.api_secret, body.session_token)
+    else: raise HTTPException(status_code=400, detail="source must be 'yfinance' or 'breeze'")
         
-    # Clear the engine memory so it fetches a clean 10-day history from the new source
     engine.memory_df = None
     engine.historical_predictions = pd.DataFrame()
-    
     await broadcast({"type": "data_source_changed", "data": status})
     return status
 
@@ -369,26 +368,17 @@ async def admin_stats(admin: dict = Depends(require_admin)):
         "signal_count":     len(engine.signal_history),
         "latest_signal":    engine.latest_signal,
         "data_source":      engine.data_mgr.status,
-        "thresholds": {
-            "long":  round(engine.long_thresh  * 100),
-            "short": round(engine.short_thresh * 100),
-        },
+        "thresholds": {"long": round(engine.long_thresh*100), "short": round(engine.short_thresh*100)},
     }
 
 @app.get("/admin/history")
 async def get_historical_signals(days_back: int = 1, admin: dict = Depends(require_admin)):
-    """
-    Returns historical price action and AI probabilities so the frontend 
-    can display yesterday's action and simulated signals.
-    """
     df = engine.historical_predictions
     if df is None or df.empty:
-        raise HTTPException(status_code=400, detail="Engine memory is empty or still warming up.")
-    
+        raise HTTPException(status_code=400, detail="Engine warming up.")
     try:
-        # Filter for only standard market hours (09:15 to 15:30)
+        # Standard NSE Hours
         df = df.between_time('09:15', '15:30')
-        
         if days_back > 0:
             last_date = df.index[-1].date()
             start_date = last_date - timedelta(days=days_back)
@@ -398,76 +388,50 @@ async def get_historical_signals(days_back: int = 1, admin: dict = Depends(requi
         for index, row in df.iterrows():
             history_list.append({
                 "time": index.strftime("%Y-%m-%d %H:%M:%S"),
+                "open": round(row.get("Open", 0), 2),
+                "high": round(row.get("High", 0), 2),
+                "low": round(row.get("Low", 0), 2),
                 "close": round(row.get("Close", 0), 2),
                 "long_prob": round(row.get("Long_Prob", 0) * 100, 1),
                 "short_prob": round(row.get("Short_Prob", 0) * 100, 1)
             })
-            
         return {"status": "ok", "records": len(history_list), "data": history_list}
     except Exception as e:
         log.error(f"Failed to generate history: {e}")
         raise HTTPException(status_code=500, detail="Failed to process historical data")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# WebSocket — authenticated, role-aware
-# ══════════════════════════════════════════════════════════════════════════════
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, token: str = Query(...)):
-    # Validate JWT before accepting
     from jose import JWTError, jwt as _jwt
     from auth import SECRET_KEY, ALGORITHM, _load_users
-
     try:
         payload  = _jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username = payload.get("sub")
         users    = _load_users()
         user     = users.get(username)
-        if not user or user["status"] != "active":
-            await ws.close(code=4001)
-            return
-    except JWTError:
-        await ws.close(code=4001)
-        return
+        if not user or user["status"] != "active": return await ws.close(code=4001)
+    except JWTError: return await ws.close(code=4001)
 
     await ws.accept()
     clients.setdefault(username, set()).add(ws)
-    log.info(f"WS connect: {username} ({user['role']})  total_sessions={sum(len(v) for v in clients.values())}")
-
-    # Immediate data push on connect
-    if engine.latest_signal:
-        await ws.send_text(json.dumps({"type": "signal",  "data": engine.latest_signal}))
-    if engine.signal_history:
-        await ws.send_text(json.dumps({"type": "history", "data": list(engine.signal_history)}))
+    if engine.latest_signal: await ws.send_text(json.dumps({"type": "signal",  "data": engine.latest_signal}))
+    if engine.signal_history: await ws.send_text(json.dumps({"type": "history", "data": list(engine.signal_history)}))
     await ws.send_text(json.dumps({"type": "data_source", "data": engine.data_mgr.status}))
 
     try:
         while True:
             raw = await ws.receive_text()
-            if raw in ("ping", ""):
-                continue
+            if raw in ("ping", ""): continue
             try:
                 msg = json.loads(raw)
-                # Threshold changes: admin only
                 if msg.get("type") == "set_threshold" and user["role"] == "admin":
-                    lt = max(0.50, min(0.99, float(msg.get("long",  engine.long_thresh))))
-                    st = max(0.50, min(0.99, float(msg.get("short", engine.short_thresh))))
-                    engine.long_thresh  = lt
-                    engine.short_thresh = st
-                    log.info(f"Thresholds set by {username}: L={lt:.0%} S={st:.0%}")
-                    if engine.latest_signal:
-                        await broadcast({"type": "signal",
-                                         "data": engine._apply_threshold(engine.latest_signal)})
-            except (json.JSONDecodeError, ValueError):
-                pass
+                    engine.long_thresh  = max(0.50, min(0.99, float(msg.get("long",  engine.long_thresh))))
+                    engine.short_thresh = max(0.50, min(0.99, float(msg.get("short", engine.short_thresh))))
+                    if engine.latest_signal: await broadcast({"type": "signal", "data": engine._apply_threshold(engine.latest_signal)})
+            except: pass
     except WebSocketDisconnect:
         clients.get(username, set()).discard(ws)
-        log.info(f"WS disconnect: {username}")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Public
-# ══════════════════════════════════════════════════════════════════════════════
 @app.get("/health")
 def health():
     return {"status": "ok", "source": engine.data_mgr.current_source}
