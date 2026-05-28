@@ -12,3 +12,4 @@ bcrypt==3.2.2
 python-jose[cryptography]
 requests
 breeze-connect
+scikit-learn
