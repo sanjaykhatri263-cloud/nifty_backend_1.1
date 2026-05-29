@@ -1,6 +1,6 @@
 """
 data_sources.py — Fixed Breeze connection for Nifty 50 index cash data
-Includes Day-by-Day Chunking to bypass ICICI's 1000-bar API limit.
+Includes Day-by-Day Chunking and IST Timezone offset for Railway UTC servers.
 """
 
 import logging
@@ -115,7 +115,8 @@ class BreezeSource(DataSource):
             log.error(f"Breeze not connected: {self.creds.error}")
             return None
         try:
-            now = datetime.utcnow()
+            # FIX: Force Indian Standard Time (IST = UTC + 5:30)
+            now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
             all_records = []
 
             if days > 0:
@@ -123,7 +124,7 @@ class BreezeSource(DataSource):
                 
                 # Fetch day by day to bypass the 1000 bar limit
                 for i in range(days, -1, -1):
-                    target_date = now - timedelta(days=i)
+                    target_date = now_ist - timedelta(days=i)
                     start = target_date.strftime("%Y-%m-%dT00:00:00.000Z")
                     end   = target_date.strftime("%Y-%m-%dT23:59:59.000Z")
                     
@@ -141,9 +142,9 @@ class BreezeSource(DataSource):
                         if recs:
                             all_records.extend(recs)
             else:
-                # Live 15-minute fetch (no chunking needed, easily under 1000 bars)
-                start = (now - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-                end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                # Live 15-minute fetch using precise IST
+                start = (now_ist - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                end   = now_ist.strftime("%Y-%m-%dT%H:%M:%S.000Z")
                 
                 resp = self._breeze.get_historical_data_v2(
                     interval="1minute",
@@ -193,9 +194,10 @@ class BreezeSource(DataSource):
         if not self.creds.connected or self._breeze is None:
             return {"ok": False, "error": self.creds.error}
         try:
-            now   = datetime.utcnow()
-            start = (now - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            # FIX: Force IST for the connection test as well
+            now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            start = (now_ist - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            end   = now_ist.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             resp  = self._breeze.get_historical_data_v2(
                 interval="1minute",
                 from_date=start,
