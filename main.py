@@ -3,9 +3,9 @@ Nifty Sniper — Live Signal Backend  v2
 =======================================
 New in v2: 
   • Stateful Memory Appending
-  • 10-Day Warmup
   • Instant Historical Backtest Generator on Boot
-  • Armored Inference Loop (Crash Recovery)
+  • Auto-Populating Live WebSocket Buffer 
+  • Candlestick & Indicator Data Payload (OHLC, Camarilla, MACD)
 """
 
 import asyncio
@@ -75,9 +75,13 @@ class NiftySniperBrain(nn.Module):
 
 
 # ── Features ──────────────────────────────────────────────────────────────────
-def generate_blueprint_features(df_dict: dict) -> pd.DataFrame:
+def generate_blueprint_features(df_dict: dict):
     master_df = df_dict["2m"][["Open", "High", "Low", "Close"]].copy()
     feature_matrix = pd.DataFrame(index=master_df.index)
+    
+    # NEW: Store raw values for the frontend without breaking the AI's 70-dimension limit
+    raw_matrix = master_df.copy() 
+    
     tfs = ["1m", "2m", "5m", "15m", "60m"]
     raw_data = {}
     for tf in tfs:
@@ -123,7 +127,15 @@ def generate_blueprint_features(df_dict: dict) -> pd.DataFrame:
         feature_matrix[f"{tf}_MA_Bull"]   = (ma18 > ma40).astype(float)
         feature_matrix[f"{tf}_Dist_MA18"] = (c - ma18) / (atr + 1e-6)
         feature_matrix[f"{tf}_MA_Spread"] = (ma18 - ma40) / (atr + 1e-6)
-    return feature_matrix.ffill().bfill()
+        
+        # NEW: Store extracted raw data for the frontend chart mapping
+        raw_matrix[f"{tf}_H4"] = h4
+        raw_matrix[f"{tf}_L4"] = l4
+        raw_matrix[f"{tf}_MACD"] = macd
+        raw_matrix[f"{tf}_Hist"] = hist
+        raw_matrix[f"{tf}_Signal"] = gs(tf, "Signal")
+
+    return feature_matrix.ffill().bfill(), raw_matrix.ffill().bfill()
 
 
 # ── Engine ────────────────────────────────────────────────────────────────────
@@ -162,8 +174,7 @@ class NiftySignalEngine:
                 "short_thresh_pct": round(self.short_thresh * 100)}
 
     def _warmup_and_backtest(self):
-        """ Instantly processes the leftover valid days from the payload into backtest signals """
-        log.info("Generating historical backtest signals for dashboard...")
+        log.info("Generating historical backtest and populating live buffer...")
         df_1m = self.memory_df.copy()
         
         freq_map = {"1m":"1min","2m":"2min","5m":"5min","15m":"15min","60m":"60min"}
@@ -176,12 +187,15 @@ class NiftySignalEngine:
         
         if len(df_dict["2m"]) < SEQ_LEN + 5: return
         
-        # This will drop the first ~7 days of NaN values caused by the 60m MA40
-        fm = generate_blueprint_features(df_dict).dropna()
+        fm, raw_fm = generate_blueprint_features(df_dict)
+        fm = fm.dropna()
+        raw_fm = raw_fm.loc[fm.index]
+        
         if len(fm) < SEQ_LEN: return
         
         records = []
-        # Loop over the remaining valid days to generate simulated past signals
+        self.signal_history.clear()
+        
         for i in range(SEQ_LEN, len(fm) + 1):
             win = fm.iloc[i-SEQ_LEN:i].values.astype(np.float32)
             scaled = self.scaler.transform(win)
@@ -192,43 +206,68 @@ class NiftySignalEngine:
                 ps = float(self.short_brain(x).item())
             
             bar_time = fm.index[i-1]
-            price = float(df_dict["2m"].loc[bar_time, "Close"])
+            r = raw_fm.loc[bar_time]
+            price = float(r["Close"])
             
+            # Save Full Profile to Memory DataFrame
             records.append(pd.DataFrame({
-                "Close": price, 
-                "Long_Prob": pl, 
-                "Short_Prob": ps
+                "Open": float(r["Open"]), "High": float(r["High"]), "Low": float(r["Low"]), "Close": price, 
+                "Long_Prob": pl, "Short_Prob": ps,
+                "H4_15m": float(r["15m_H4"]), "L4_15m": float(r["15m_L4"]),
+                "H4_60m": float(r["60m_H4"]), "L4_60m": float(r["60m_L4"]),
+                "MACD": float(r["2m_MACD"]), "MACD_Hist": float(r["2m_Hist"]), "MACD_Signal": float(r["2m_Signal"])
             }, index=[bar_time]))
+            
+            # Send Full Profile to Live User Buffer
+            result = {
+                "timestamp":        bar_time.isoformat() + "Z",
+                "bar_time":         str(bar_time),
+                "open":             round(float(r["Open"]), 2),
+                "high":             round(float(r["High"]), 2),
+                "low":              round(float(r["Low"]), 2),
+                "close":            round(price, 2),
+                "price":            round(price, 2), # Included to prevent App.jsx crashing
+                "prob_long":        round(pl * 100, 1),
+                "prob_short":       round(ps * 100, 1),
+                "signal":           self._decide(pl, ps),
+                "long_thresh_pct":  round(self.long_thresh  * 100),
+                "short_thresh_pct": round(self.short_thresh * 100),
+                "rsi_2m":           round(float(fm["2m_RSI"].iloc[i-1]), 1),
+                "adx_2m":           round(float(fm["2m_ADX"].iloc[i-1]), 1),
+                "ma_bull_2m":       int(fm["2m_MA_Bull"].iloc[i-1]),
+                "h4_15m":           round(float(r["15m_H4"]), 2),
+                "l4_15m":           round(float(r["15m_L4"]), 2),
+                "h4_60m":           round(float(r["60m_H4"]), 2),
+                "l4_60m":           round(float(r["60m_L4"]), 2),
+                "macd":             round(float(r["2m_MACD"]), 2),
+                "macd_hist":        round(float(r["2m_Hist"]), 2),
+                "macd_signal":      round(float(r["2m_Signal"]), 2),
+                "data_source":      self.data_mgr.current_source,
+            }
+            self.signal_history.appendleft(result)
+            self.latest_signal = result
         
         if records:
             self.historical_predictions = pd.concat(records)
-            log.info(f"Backtest ready! {len(self.historical_predictions)} historical signals computed.")
+            log.info(f"Backtest ready! Live buffer populated with latest {len(self.signal_history)} bars.")
 
     def run_inference(self) -> Optional[dict]:
-        # 1. Stateful Data Fetching Logic (15 Days on boot, 15 Mins thereafter)
         if self.memory_df is None or self.memory_df.empty:
             log.info("Engine waking up: Fetching 15 days of history to warm up 60m indicators...")
             new_df = self.data_mgr.fetch_1m_ohlc(days=15, minutes=0)
             if new_df is None: return None
             self.memory_df = new_df
-            
-            # Instantly calculate the backtest
             self._warmup_and_backtest()
         else:
             log.info("Engine active: Fetching last 15 minutes of live ticks...")
             new_df = self.data_mgr.fetch_1m_ohlc(days=0, minutes=15)
             if new_df is None: return None
             
-            # Append, remove duplicates, and sort
             merged = pd.concat([self.memory_df, new_df])
             merged = merged[~merged.index.duplicated(keep='last')].sort_index()
-            
-            # Keep memory capped at roughly 10 trading days
             self.memory_df = merged.tail(4000)
 
-        # Work on a copy of the memory
         df_1m = self.memory_df.copy()
-        
         freq_map = {"1m":"1min","2m":"2min","5m":"5min","15m":"15min","60m":"60min"}
         df_dict  = {
             tf: df_1m.resample(freq).agg(
@@ -237,13 +276,12 @@ class NiftySignalEngine:
             for tf, freq in freq_map.items()
         }
         
-        if len(df_dict["2m"]) < SEQ_LEN + 5:
-            log.warning("Not enough 2m bars after resample")
-            return None
+        if len(df_dict["2m"]) < SEQ_LEN + 5: return None
             
-        fm = generate_blueprint_features(df_dict).dropna()
-        if len(fm) < SEQ_LEN:
-            return None
+        fm, raw_fm = generate_blueprint_features(df_dict)
+        fm = fm.dropna()
+        raw_fm = raw_fm.loc[fm.index]
+        if len(fm) < SEQ_LEN: return None
             
         win    = fm.iloc[-SEQ_LEN:].values.astype(np.float32)
         scaled = self.scaler.transform(win)
@@ -253,24 +291,33 @@ class NiftySignalEngine:
             pl = float(self.long_brain(x).item())
             ps = float(self.short_brain(x).item())
             
+        r      = raw_fm.iloc[-1]
         signal = self._decide(pl, ps)
-        price  = float(df_dict["2m"]["Close"].iloc[-1])
-        bar    = df_dict["2m"].index[-1]
+        price  = float(r["Close"])
+        bar    = fm.index[-1]
         
-        # Save live prediction into memory for the historical endpoint
         if self.historical_predictions.empty or bar not in self.historical_predictions.index:
-            new_pred = pd.DataFrame({"Close": price, "Long_Prob": pl, "Short_Prob": ps}, index=[bar])
+            new_pred = pd.DataFrame({
+                "Open": float(r["Open"]), "High": float(r["High"]), "Low": float(r["Low"]), "Close": price, 
+                "Long_Prob": pl, "Short_Prob": ps,
+                "H4_15m": float(r["15m_H4"]), "L4_15m": float(r["15m_L4"]),
+                "H4_60m": float(r["60m_H4"]), "L4_60m": float(r["60m_L4"]),
+                "MACD": float(r["2m_MACD"]), "MACD_Hist": float(r["2m_Hist"]), "MACD_Signal": float(r["2m_Signal"])
+            }, index=[bar])
+            
             if self.historical_predictions.empty:
                 self.historical_predictions = new_pred
             else:
                 self.historical_predictions = pd.concat([self.historical_predictions, new_pred])
-            
-            # Cap backtest history at 2000 rows (approx 5-6 trading days)
             self.historical_predictions = self.historical_predictions.tail(2000) 
             
         result = {
             "timestamp":        datetime.now(timezone.utc).isoformat(),
             "bar_time":         str(bar),
+            "open":             round(float(r["Open"]), 2),
+            "high":             round(float(r["High"]), 2),
+            "low":              round(float(r["Low"]), 2),
+            "close":            round(price, 2),
             "price":            round(price, 2),
             "prob_long":        round(pl * 100, 1),
             "prob_short":       round(ps * 100, 1),
@@ -280,6 +327,13 @@ class NiftySignalEngine:
             "rsi_2m":           round(float(fm["2m_RSI"].iloc[-1]), 1),
             "adx_2m":           round(float(fm["2m_ADX"].iloc[-1]), 1),
             "ma_bull_2m":       int(fm["2m_MA_Bull"].iloc[-1]),
+            "h4_15m":           round(float(r["15m_H4"]), 2),
+            "l4_15m":           round(float(r["15m_L4"]), 2),
+            "h4_60m":           round(float(r["60m_H4"]), 2),
+            "l4_60m":           round(float(r["60m_L4"]), 2),
+            "macd":             round(float(r["2m_MACD"]), 2),
+            "macd_hist":        round(float(r["2m_Hist"]), 2),
+            "macd_signal":      round(float(r["2m_Signal"]), 2),
             "data_source":      self.data_mgr.current_source,
         }
         
@@ -293,11 +347,9 @@ class NiftySignalEngine:
 app    = FastAPI(title="Nifty Sniper API v2")
 engine = NiftySignalEngine()
 
-# connected WebSockets keyed by username
 clients: dict[str, set[WebSocket]] = {}   
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
 
 async def broadcast(payload: dict):
     msg  = json.dumps(payload)
@@ -311,21 +363,15 @@ async def broadcast(payload: dict):
     for uname, ws in dead:
         clients.get(uname, set()).discard(ws)
 
-
 async def inference_loop():
     while True:
         try:
-            # Run the AI engine
             result = await asyncio.get_event_loop().run_in_executor(None, engine.run_inference)
             if result:
                 await broadcast({"type": "signal", "data": result})
         except Exception as e:
-            # SAFETY NET: If the AI crashes, catch the error, log it, but KEEP THE LOOP ALIVE.
             log.error(f"Critical Engine Error (Recovering in {POLL_SECS}s): {e}", exc_info=True)
-            
-        # Wait 60 seconds and try again, no matter what happened
         await asyncio.sleep(POLL_SECS)
-
 
 @app.on_event("startup")
 async def startup():
@@ -333,9 +379,7 @@ async def startup():
     log.info("Inference loop started")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Auth endpoints
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Auth & Admin Endpoints ────────────────────────────────────────────────────
 @app.post("/auth/token", response_model=Token)
 async def login(form: OAuth2PasswordRequestForm = Depends()):
     user = authenticate_user(form.username, form.password)
@@ -351,10 +395,6 @@ async def login(form: OAuth2PasswordRequestForm = Depends()):
 async def me(user: dict = Depends(get_current_user)):
     return {k: v for k, v in user.items() if k != "hashed_pw"}
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Admin — subscriber management
-# ══════════════════════════════════════════════════════════════════════════════
 @app.get("/admin/subscribers", response_model=list[UserOut])
 async def get_subscribers(admin: dict = Depends(require_admin)):
     return list_subscribers()
@@ -383,10 +423,6 @@ async def reset_password(username: str, body: PasswordReset, admin: dict = Depen
     change_password(username, body.new_password)
     return {"ok": True}
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Admin — data source management & History
-# ══════════════════════════════════════════════════════════════════════════════
 @app.get("/admin/data-source")
 async def get_data_source(admin: dict = Depends(require_admin)):
     return engine.data_mgr.status
@@ -411,9 +447,10 @@ async def switch_data_source(body: DataSourceSwitch, admin: dict = Depends(requi
     else:
         raise HTTPException(status_code=400, detail="source must be 'yfinance' or 'breeze'")
         
-    # Clear the engine memory so it fetches a clean 15-day history from the new source
     engine.memory_df = None
     engine.historical_predictions = pd.DataFrame()
+    engine.signal_history.clear()
+    engine.latest_signal = {}
     
     await broadcast({"type": "data_source_changed", "data": status})
     return status
@@ -433,18 +470,12 @@ async def admin_stats(admin: dict = Depends(require_admin)):
 
 @app.get("/admin/history")
 async def get_historical_signals(days_back: int = 1, admin: dict = Depends(require_admin)):
-    """
-    Returns historical price action and AI probabilities so the frontend 
-    can display yesterday's action and simulated signals.
-    """
     df = engine.historical_predictions
     if df is None or df.empty:
         raise HTTPException(status_code=400, detail="Engine memory is empty or still warming up.")
     
     try:
-        # Filter for only standard market hours (09:15 to 15:30)
         df = df.between_time('09:15', '15:30')
-        
         if days_back > 0:
             last_date = df.index[-1].date()
             start_date = last_date - timedelta(days=days_back)
@@ -454,9 +485,20 @@ async def get_historical_signals(days_back: int = 1, admin: dict = Depends(requi
         for index, row in df.iterrows():
             history_list.append({
                 "time": index.strftime("%Y-%m-%d %H:%M:%S"),
+                "open": round(row.get("Open", 0), 2),
+                "high": round(row.get("High", 0), 2),
+                "low": round(row.get("Low", 0), 2),
                 "close": round(row.get("Close", 0), 2),
+                "price": round(row.get("Close", 0), 2),
                 "long_prob": round(row.get("Long_Prob", 0) * 100, 1),
-                "short_prob": round(row.get("Short_Prob", 0) * 100, 1)
+                "short_prob": round(row.get("Short_Prob", 0) * 100, 1),
+                "h4_15m": round(row.get("H4_15m", 0), 2),
+                "l4_15m": round(row.get("L4_15m", 0), 2),
+                "h4_60m": round(row.get("H4_60m", 0), 2),
+                "l4_60m": round(row.get("L4_60m", 0), 2),
+                "macd": round(row.get("MACD", 0), 2),
+                "macd_hist": round(row.get("MACD_Hist", 0), 2),
+                "macd_signal": round(row.get("MACD_Signal", 0), 2),
             })
             
         return {"status": "ok", "records": len(history_list), "data": history_list}
@@ -465,9 +507,7 @@ async def get_historical_signals(days_back: int = 1, admin: dict = Depends(requi
         raise HTTPException(status_code=500, detail="Failed to process historical data")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# WebSocket — authenticated, role-aware
-# ══════════════════════════════════════════════════════════════════════════════
+# ── WebSockets & Health ───────────────────────────────────────────────────────
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, token: str = Query(...)):
     from jose import JWTError, jwt as _jwt
@@ -517,10 +557,6 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...)):
         clients.get(username, set()).discard(ws)
         log.info(f"WS disconnect: {username}")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Public
-# ══════════════════════════════════════════════════════════════════════════════
 @app.get("/health")
 def health():
     return {"status": "ok", "source": engine.data_mgr.current_source}
