@@ -5,6 +5,7 @@ New in v2:
   • Stateful Memory Appending
   • 10-Day Warmup
   • Instant Historical Backtest Generator on Boot
+  • Armored Inference Loop (Crash Recovery)
 """
 
 import asyncio
@@ -161,7 +162,7 @@ class NiftySignalEngine:
                 "short_thresh_pct": round(self.short_thresh * 100)}
 
     def _warmup_and_backtest(self):
-        """ Instantly processes the leftover valid days from the 10-day payload into backtest signals """
+        """ Instantly processes the leftover valid days from the payload into backtest signals """
         log.info("Generating historical backtest signals for dashboard...")
         df_1m = self.memory_df.copy()
         
@@ -180,7 +181,7 @@ class NiftySignalEngine:
         if len(fm) < SEQ_LEN: return
         
         records = []
-        # Loop over the remaining valid 3-4 days to generate simulated past signals
+        # Loop over the remaining valid days to generate simulated past signals
         for i in range(SEQ_LEN, len(fm) + 1):
             win = fm.iloc[i-SEQ_LEN:i].values.astype(np.float32)
             scaled = self.scaler.transform(win)
@@ -204,9 +205,9 @@ class NiftySignalEngine:
             log.info(f"Backtest ready! {len(self.historical_predictions)} historical signals computed.")
 
     def run_inference(self) -> Optional[dict]:
-        # 1. Stateful Data Fetching Logic (10 Days on boot, 15 Mins thereafter)
+        # 1. Stateful Data Fetching Logic (15 Days on boot, 15 Mins thereafter)
         if self.memory_df is None or self.memory_df.empty:
-            log.info("Engine waking up: Fetching 10 days of history to warm up 60m indicators...")
+            log.info("Engine waking up: Fetching 15 days of history to warm up 60m indicators...")
             new_df = self.data_mgr.fetch_1m_ohlc(days=15, minutes=0)
             if new_df is None: return None
             self.memory_df = new_df
@@ -313,9 +314,16 @@ async def broadcast(payload: dict):
 
 async def inference_loop():
     while True:
-        result = await asyncio.get_event_loop().run_in_executor(None, engine.run_inference)
-        if result:
-            await broadcast({"type": "signal", "data": result})
+        try:
+            # Run the AI engine
+            result = await asyncio.get_event_loop().run_in_executor(None, engine.run_inference)
+            if result:
+                await broadcast({"type": "signal", "data": result})
+        except Exception as e:
+            # SAFETY NET: If the AI crashes, catch the error, log it, but KEEP THE LOOP ALIVE.
+            log.error(f"Critical Engine Error (Recovering in {POLL_SECS}s): {e}", exc_info=True)
+            
+        # Wait 60 seconds and try again, no matter what happened
         await asyncio.sleep(POLL_SECS)
 
 
@@ -403,7 +411,7 @@ async def switch_data_source(body: DataSourceSwitch, admin: dict = Depends(requi
     else:
         raise HTTPException(status_code=400, detail="source must be 'yfinance' or 'breeze'")
         
-    # Clear the engine memory so it fetches a clean 10-day history from the new source
+    # Clear the engine memory so it fetches a clean 15-day history from the new source
     engine.memory_df = None
     engine.historical_predictions = pd.DataFrame()
     
