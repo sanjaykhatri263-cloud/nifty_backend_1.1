@@ -1,6 +1,6 @@
 """
 data_sources.py — Fixed Breeze connection for Nifty 50 index cash data
-Supports dynamic historical fetching (days) and live ticking (minutes).
+Includes Day-by-Day Chunking to bypass ICICI's 1000-bar API limit.
 """
 
 import logging
@@ -41,8 +41,8 @@ class YFinanceSource(DataSource):
             })
             ticker = yf.Ticker(self.TICKER, session=session)
             
-            # yfinance uses strict periods. If days > 0 use 5d/1mo, else use 1d
-            period = "1mo" if days > 5 else "5d" if days > 0 else "1d"
+            # yfinance uses strict periods. Max 7d for 1-minute data.
+            period = "7d" if days > 0 else "1d"
             raw    = ticker.history(period=period, interval="1m", auto_adjust=True)
             
             if raw is None or raw.empty or len(raw) < 5:
@@ -116,36 +116,56 @@ class BreezeSource(DataSource):
             return None
         try:
             now = datetime.utcnow()
-            
-            # Dynamic Time Strategy (Pure UTC)
+            all_records = []
+
             if days > 0:
-                start = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            else:
-                start = (now - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                log.info(f"Breeze: Bypassing API limits. Fetching {days} days chunk-by-chunk...")
                 
-            end = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                # Fetch day by day to bypass the 1000 bar limit
+                for i in range(days, -1, -1):
+                    target_date = now - timedelta(days=i)
+                    start = target_date.strftime("%Y-%m-%dT00:00:00.000Z")
+                    end   = target_date.strftime("%Y-%m-%dT23:59:59.000Z")
+                    
+                    resp = self._breeze.get_historical_data_v2(
+                        interval="1minute",
+                        from_date=start,
+                        to_date=end,
+                        stock_code="NIFTY",       
+                        exchange_code="NSE",
+                        product_type="cash"
+                    )
+                    
+                    if resp and resp.get("Status") == 200:
+                        recs = resp.get("Success", [])
+                        if recs:
+                            all_records.extend(recs)
+            else:
+                # Live 15-minute fetch (no chunking needed, easily under 1000 bars)
+                start = (now - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                end   = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                
+                resp = self._breeze.get_historical_data_v2(
+                    interval="1minute",
+                    from_date=start,
+                    to_date=end,
+                    stock_code="NIFTY",       
+                    exchange_code="NSE",
+                    product_type="cash"
+                )
+                if resp and resp.get("Status") == 200:
+                    all_records.extend(resp.get("Success", []))
 
-            log.info(f"Breeze fetching NIFTY from {start} to {end}")
-
-            resp = self._breeze.get_historical_data_v2(
-                interval="1minute",
-                from_date=start,
-                to_date=end,
-                stock_code="NIFTY",       
-                exchange_code="NSE",
-                product_type="cash",
-            )
-
-            if not resp or resp.get("Status") != 200:
-                log.error(f"Breeze error: {resp.get('Error') if resp else 'Empty'}")
+            if not all_records:
+                log.warning("Breeze: Status 200 but no records found")
                 return None
 
-            records = resp.get("Success", [])
-            if not records:
-                log.warning("Breeze: Status 200 but no records — market may be closed")
-                return None
+            # Convert to DataFrame
+            df = pd.DataFrame(all_records)
+            
+            # Remove duplicates in case of boundary overlaps
+            df = df.drop_duplicates(subset=['datetime'])
 
-            df = pd.DataFrame(records)
             df = df.rename(columns={
                 "datetime": "Datetime",
                 "open":     "Open",
@@ -162,7 +182,7 @@ class BreezeSource(DataSource):
                         else df.index)
             df = df.dropna()
 
-            log.info(f"Breeze OK: {len(df)} bars fetched | latest: {df.index[-1]}")
+            log.info(f"Breeze OK: {len(df)} total bars stitched | latest: {df.index[-1]}")
             return df
 
         except Exception as e:
