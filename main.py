@@ -1,10 +1,10 @@
 """
-Nifty Sniper — Live Signal Backend  v3
+Nifty Sniper — Live Signal Backend  v3.1
 =======================================
-  • Stateful Memory Appending
+  • Stateful Memory Appending (Expanded to 30 Days)
   • Candlestick & Indicator Data Payload
-  • Explicit IST (+05:30) Timezone Enforcement via UNIX Epochs
-  • DUAL ENGINE: Computes both Mode 1 (Repaint) and Mode 2 (Strict) concurrently
+  • Explicit IST (+05:30) Timezone Enforcement
+  • DUAL ENGINE: Computes both Mode 1 (Repaint) and Mode 2 (Strict)
 """
 
 import asyncio
@@ -135,10 +135,9 @@ class NiftySignalEngine:
         self.latest_signal: dict   = {}
         self.data_mgr      = DataSourceManager()
         
-        # Centralized Settings Dictionary for Dual Mode Execution
         self.settings = {
-            "sig_mode": 1,      # 1 = Repaint, 2 = Strict
-            "ind_mode": 1,      # 1 = Repaint, 2 = Strict
+            "sig_mode": 1,
+            "ind_mode": 1,
             "long_thresh": 80,
             "short_thresh": 80
         }
@@ -170,7 +169,7 @@ class NiftySignalEngine:
         fm, raw_fm = generate_blueprint_features(df_dict)
         fm = fm.dropna()
         if mode == 2 and len(fm) > SEQ_LEN:
-            fm = fm.iloc[:-1] # Drop forming open candle to prevent repainting leak
+            fm = fm.iloc[:-1]
             
         raw_fm = raw_fm.loc[fm.index]
         return fm, raw_fm
@@ -183,7 +182,7 @@ class NiftySignalEngine:
             return float(self.long_brain(x).item()), float(self.short_brain(x).item())
 
     def _warmup_and_backtest(self):
-        log.info("Generating dual-mode backtest and populating live buffer...")
+        log.info("Generating dual-mode 30-day backtest and populating live buffer...")
         df_1m = self.memory_df.copy()
         
         fm1, raw1 = self._compute_mode(df_1m, 1)
@@ -225,12 +224,14 @@ class NiftySignalEngine:
             self.signal_history.appendleft(res)
             self.latest_signal = res
             
-        self.historical_predictions = pd.DataFrame(records).tail(5000) # Plenty of space for 5+ days
-        log.info(f"Backtest ready! Buffer populated with dual-mode data.")
+        # Expanded capacity to handle 30 full days of 2m bars (approx 5,610 bars)
+        self.historical_predictions = pd.DataFrame(records).tail(15000) 
+        log.info(f"Backtest ready! {len(self.historical_predictions)} historical signals computed.")
 
     def run_inference(self) -> Optional[dict]:
         if self.memory_df is None or self.memory_df.empty:
-            new_df = self.data_mgr.fetch_1m_ohlc(days=15, minutes=0)
+            # Fetch 30 days on boot
+            new_df = self.data_mgr.fetch_1m_ohlc(days=30, minutes=0)
             if new_df is None: return None
             self.memory_df = new_df
             self._warmup_and_backtest()
@@ -239,7 +240,8 @@ class NiftySignalEngine:
         new_df = self.data_mgr.fetch_1m_ohlc(days=0, minutes=15)
         if new_df is None: return None
         merged = pd.concat([self.memory_df, new_df])
-        self.memory_df = merged[~merged.index.duplicated(keep='last')].sort_index().tail(4000)
+        # Expanded 1m memory limit to handle a full month (approx 11,250 bars)
+        self.memory_df = merged[~merged.index.duplicated(keep='last')].sort_index().tail(20000)
         
         df_1m = self.memory_df.copy()
         fm1, raw1 = self._compute_mode(df_1m, 1)
@@ -275,14 +277,14 @@ class NiftySignalEngine:
         if self.historical_predictions.empty or unix_sec not in self.historical_predictions['unix'].values:
             df_new = pd.DataFrame([res])
             if self.historical_predictions.empty: self.historical_predictions = df_new
-            else: self.historical_predictions = pd.concat([self.historical_predictions, df_new]).tail(5000)
+            else: self.historical_predictions = pd.concat([self.historical_predictions, df_new]).tail(15000)
             
         self.signal_history.appendleft(res)
         self.latest_signal = res
         return res
 
 
-app    = FastAPI(title="Nifty Sniper API v3")
+app    = FastAPI(title="Nifty Sniper API v3.1")
 engine = NiftySignalEngine()
 clients: dict[str, set[WebSocket]] = {}   
 
@@ -375,11 +377,7 @@ async def get_historical_signals(days_back: int = 1, admin: dict = Depends(requi
     df = engine.historical_predictions
     if df is None or df.empty: raise HTTPException(status_code=400, detail="Engine empty.")
     try:
-        # Sort values properly
         df = df.sort_values('unix')
-        
-        # We don't filter `between_time` here so that full Candlestick continuity works.
-        # Lightweight charts handles time gaps automatically.
         if days_back > 0:
             start_unix = df['unix'].iloc[-1] - (days_back * 86400)
             df = df[df['unix'] >= start_unix]
