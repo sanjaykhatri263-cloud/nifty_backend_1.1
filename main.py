@@ -3,8 +3,8 @@ Nifty Sniper — Live Signal Backend  v3
 =======================================
   • Stateful Memory Appending
   • Candlestick & Indicator Data Payload
-  • Explicit IST (+05:30) Timezone Enforcement
-  • Mode 1 (Repaint) vs Mode 2 (Strict) Global Toggle
+  • Explicit IST (+05:30) Timezone Enforcement via UNIX Epochs
+  • DUAL ENGINE: Computes both Mode 1 (Repaint) and Mode 2 (Strict) concurrently
 """
 
 import asyncio
@@ -48,8 +48,6 @@ INPUT_DIM   = 70
 D_MODEL     = 128
 N_HEAD      = 4
 NUM_LAYERS  = 3
-LONG_THRESH = 0.80   
-SHORT_THRESH= 0.80
 POLL_SECS   = 60
 
 class NiftySniperBrain(nn.Module):
@@ -120,6 +118,9 @@ def generate_blueprint_features(df_dict: dict):
         raw_matrix[f"{tf}_MACD"] = macd
         raw_matrix[f"{tf}_Hist"] = hist
         raw_matrix[f"{tf}_Signal"] = gs(tf, "Signal")
+        raw_matrix[f"{tf}_RSI"] = rsi
+        raw_matrix[f"{tf}_ADX"] = adx
+        raw_matrix[f"{tf}_MA_Bull"] = (ma18 > ma40).astype(float)
 
     return feature_matrix.ffill().bfill(), raw_matrix.ffill().bfill()
 
@@ -132,16 +133,19 @@ class NiftySignalEngine:
         self.short_brain   = self._load(SHORT_PATH)
         self.signal_history: deque = deque(maxlen=200)
         self.latest_signal: dict   = {}
-        self.long_thresh   = LONG_THRESH
-        self.short_thresh  = SHORT_THRESH
         self.data_mgr      = DataSourceManager()
         
-        # Admin Toggles
-        self.eval_mode     = 1  # 1 = Classic (Repaint), 2 = Strict (No Repaint)
+        # Centralized Settings Dictionary for Dual Mode Execution
+        self.settings = {
+            "sig_mode": 1,      # 1 = Repaint, 2 = Strict
+            "ind_mode": 1,      # 1 = Repaint, 2 = Strict
+            "long_thresh": 80,
+            "short_thresh": 80
+        }
         
         self.memory_df: Optional[pd.DataFrame] = None
         self.historical_predictions: pd.DataFrame = pd.DataFrame()
-        log.info("Engine ready ✓")
+        log.info("Dual-Engine ready ✓")
 
     def _load(self, path):
         m = NiftySniperBrain()
@@ -149,85 +153,80 @@ class NiftySignalEngine:
         m.eval()
         return m
 
-    def _decide(self, pl, ps):
-        if pl >= self.long_thresh  and pl > ps: return "BUY"
-        if ps >= self.short_thresh and ps > pl: return "SELL"
-        return "WAIT"
-
-    def _apply_threshold(self, r: dict) -> dict:
-        sig = self._decide(r["prob_long"] / 100, r["prob_short"] / 100)
-        return {**r, "signal": sig, "long_thresh_pct": round(self.long_thresh * 100), "short_thresh_pct": round(self.short_thresh * 100)}
-
     def _format_ist(self, dt_obj):
-        """Forces output to strictly defined +05:30 ISO strings so frontend perfectly maps to IST."""
-        if dt_obj.tzinfo is None:
-            dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+        if dt_obj.tzinfo is None: dt_obj = dt_obj.replace(tzinfo=timezone.utc)
         ist_time = dt_obj.astimezone(timezone(timedelta(hours=5, minutes=30)))
         return ist_time.strftime("%Y-%m-%dT%H:%M:%S+05:30")
 
-    def _get_resampled_dict(self, df_1m):
+    def _compute_mode(self, df_1m, mode):
         freq_map = {"1m":"1min","2m":"2min","5m":"5min","15m":"15min","60m":"60min"}
-        if self.eval_mode == 1:
-            return {tf: df_1m.resample(freq).agg({"Open":"first","High":"max","Low":"min","Close":"last"}).dropna() for tf, freq in freq_map.items()}
+        if mode == 1:
+            df_dict = {tf: df_1m.resample(freq).agg({"Open":"first","High":"max","Low":"min","Close":"last"}).dropna() for tf, freq in freq_map.items()}
         else:
-            return {tf: df_1m.resample(freq, label='right', closed='right').agg({"Open":"first","High":"max","Low":"min","Close":"last"}).dropna() for tf, freq in freq_map.items()}
-
-    def _warmup_and_backtest(self):
-        log.info(f"Rebuilding history under Mode {self.eval_mode} rules...")
-        if self.memory_df is None or self.memory_df.empty: return
-        
-        df_dict = self._get_resampled_dict(self.memory_df.copy())
-        if len(df_dict["2m"]) < SEQ_LEN + 5: return
+            df_dict = {tf: df_1m.resample(freq, label='right', closed='right').agg({"Open":"first","High":"max","Low":"min","Close":"last"}).dropna() for tf, freq in freq_map.items()}
+            
+        if len(df_dict["2m"]) < SEQ_LEN + 5: return None, None
         
         fm, raw_fm = generate_blueprint_features(df_dict)
         fm = fm.dropna()
-        raw_fm = raw_fm.loc[fm.index]
-        
-        # If Strict Mode, ignore the very last forming candle of the historical pull
-        if self.eval_mode == 2 and len(fm) > SEQ_LEN:
-            fm = fm.iloc[:-1]
-            raw_fm = raw_fm.loc[fm.index]
+        if mode == 2 and len(fm) > SEQ_LEN:
+            fm = fm.iloc[:-1] # Drop forming open candle to prevent repainting leak
             
-        if len(fm) < SEQ_LEN: return
+        raw_fm = raw_fm.loc[fm.index]
+        return fm, raw_fm
+
+    def _eval_bar(self, fm, i):
+        win = fm.iloc[i-SEQ_LEN:i].values.astype(np.float32)
+        scaled = self.scaler.transform(win)
+        x = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            return float(self.long_brain(x).item()), float(self.short_brain(x).item())
+
+    def _warmup_and_backtest(self):
+        log.info("Generating dual-mode backtest and populating live buffer...")
+        df_1m = self.memory_df.copy()
+        
+        fm1, raw1 = self._compute_mode(df_1m, 1)
+        fm2, raw2 = self._compute_mode(df_1m, 2)
+        if fm1 is None: return
         
         records = []
         self.signal_history.clear()
         
-        for i in range(SEQ_LEN, len(fm) + 1):
-            win = fm.iloc[i-SEQ_LEN:i].values.astype(np.float32)
-            scaled = self.scaler.transform(win)
-            x = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0)
+        for i1 in range(SEQ_LEN, len(fm1) + 1):
+            bar_time = fm1.index[i1-1]
+            pl1, ps1 = self._eval_bar(fm1, i1)
+                
+            pl2, ps2 = 0.0, 0.0
+            if fm2 is not None and bar_time in fm2.index:
+                i2 = fm2.index.get_loc(bar_time) + 1
+                if i2 >= SEQ_LEN:
+                    pl2, ps2 = self._eval_bar(fm2, i2)
+                        
+            r1 = raw1.loc[bar_time]
+            price = float(r1["Close"])
             
-            with torch.no_grad():
-                pl = float(self.long_brain(x).item())
-                ps = float(self.short_brain(x).item())
+            dt_utc = bar_time if bar_time.tzinfo is not None else bar_time.replace(tzinfo=timezone.utc)
+            unix_sec = int(dt_utc.timestamp())
+            ist_str = self._format_ist(dt_utc)
             
-            bar_time = fm.index[i-1]
-            r = raw_fm.loc[bar_time]
-            price = float(r["Close"])
-            ist_iso = self._format_ist(bar_time)
-            
-            records.append(pd.DataFrame({
-                "Close": price, "Long_Prob": pl, "Short_Prob": ps,
-            }, index=[bar_time]))
-            
-            result = {
-                "timestamp":        ist_iso, "bar_time": ist_iso,
-                "open": round(float(r["Open"]), 2), "high": round(float(r["High"]), 2), "low": round(float(r["Low"]), 2), "close": round(price, 2), "price": round(price, 2),
-                "prob_long": round(pl * 100, 1), "prob_short": round(ps * 100, 1),
-                "signal": self._decide(pl, ps), "long_thresh_pct": round(self.long_thresh * 100), "short_thresh_pct": round(self.short_thresh * 100),
-                "rsi_2m": round(float(fm["2m_RSI"].iloc[i-1]), 1), "adx_2m": round(float(fm["2m_ADX"].iloc[i-1]), 1), "ma_bull_2m": int(fm["2m_MA_Bull"].iloc[i-1]),
-                "h4_15m": round(float(r["15m_H4"]), 2), "l4_15m": round(float(r["15m_L4"]), 2),
-                "h4_60m": round(float(r["60m_H4"]), 2), "l4_60m": round(float(r["60m_L4"]), 2),
-                "macd": round(float(r["2m_MACD"]), 2), "macd_hist": round(float(r["2m_Hist"]), 2), "macd_signal": round(float(r["2m_Signal"]), 2),
-                "data_source": self.data_mgr.current_source, "eval_mode": self.eval_mode
+            res = {
+                "time": ist_str, "unix": unix_sec,
+                "open": float(r1["Open"]), "high": float(r1["High"]), "low": float(r1["Low"]), "close": price, "price": price,
+                "prob_long_m1": round(pl1*100, 1), "prob_short_m1": round(ps1*100, 1),
+                "prob_long_m2": round(pl2*100, 1), "prob_short_m2": round(ps2*100, 1),
+                "h4_15m": float(r1["15m_H4"]), "l4_15m": float(r1["15m_L4"]),
+                "h4_60m": float(r1["60m_H4"]), "l4_60m": float(r1["60m_L4"]),
+                "macd": float(r1["2m_MACD"]), "macd_hist": float(r1["2m_Hist"]), "macd_signal": float(r1["2m_Signal"]),
+                "adx_2m": float(r1["2m_ADX"]), "rsi_2m": float(r1["2m_RSI"]), "ma_bull_2m": float(r1["2m_MA_Bull"]),
+                "data_source": self.data_mgr.current_source
             }
-            self.signal_history.appendleft(result)
-            self.latest_signal = result
-        
-        if records:
-            self.historical_predictions = pd.concat(records)
-            log.info("Live buffer populated successfully.")
+            records.append(res)
+            self.signal_history.appendleft(res)
+            self.latest_signal = res
+            
+        self.historical_predictions = pd.DataFrame(records).tail(5000) # Plenty of space for 5+ days
+        log.info(f"Backtest ready! Buffer populated with dual-mode data.")
 
     def run_inference(self) -> Optional[dict]:
         if self.memory_df is None or self.memory_df.empty:
@@ -235,63 +234,55 @@ class NiftySignalEngine:
             if new_df is None: return None
             self.memory_df = new_df
             self._warmup_and_backtest()
-        else:
-            new_df = self.data_mgr.fetch_1m_ohlc(days=0, minutes=15)
-            if new_df is None: return None
-            merged = pd.concat([self.memory_df, new_df])
-            self.memory_df = merged[~merged.index.duplicated(keep='last')].sort_index().tail(4000)
-
-        df_dict = self._get_resampled_dict(self.memory_df.copy())
-        if len(df_dict["2m"]) < SEQ_LEN + 5: return None
+            return self.latest_signal
             
-        fm, raw_fm = generate_blueprint_features(df_dict)
-        fm = fm.dropna()
+        new_df = self.data_mgr.fetch_1m_ohlc(days=0, minutes=15)
+        if new_df is None: return None
+        merged = pd.concat([self.memory_df, new_df])
+        self.memory_df = merged[~merged.index.duplicated(keep='last')].sort_index().tail(4000)
         
-        # CRITICAL DIFFERENCE: Mode 1 evaluates open candle. Mode 2 evaluates closed candle.
-        if self.eval_mode == 2 and len(fm) > SEQ_LEN:
-            fm = fm.iloc[:-1]
-            
-        raw_fm = raw_fm.loc[fm.index]
-        if len(fm) < SEQ_LEN: return None
-            
-        win    = fm.iloc[-SEQ_LEN:].values.astype(np.float32)
-        scaled = self.scaler.transform(win)
-        x      = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0)
+        df_1m = self.memory_df.copy()
+        fm1, raw1 = self._compute_mode(df_1m, 1)
+        fm2, raw2 = self._compute_mode(df_1m, 2)
+        if fm1 is None or len(fm1) < SEQ_LEN: return None
         
-        with torch.no_grad():
-            pl = float(self.long_brain(x).item())
-            ps = float(self.short_brain(x).item())
+        bar_time = fm1.index[-1]
+        pl1, ps1 = self._eval_bar(fm1, len(fm1))
             
-        r       = raw_fm.iloc[-1]
-        signal  = self._decide(pl, ps)
-        price   = float(r["Close"])
-        bar     = fm.index[-1]
-        ist_iso = self._format_ist(bar)
+        pl2, ps2 = 0.0, 0.0
+        if fm2 is not None and bar_time in fm2.index:
+            i2 = fm2.index.get_loc(bar_time) + 1
+            if i2 >= SEQ_LEN: pl2, ps2 = self._eval_bar(fm2, i2)
+                    
+        r1 = raw1.loc[bar_time]
+        price = float(r1["Close"])
+        dt_utc = bar_time if bar_time.tzinfo is not None else bar_time.replace(tzinfo=timezone.utc)
+        unix_sec = int(dt_utc.timestamp())
+        ist_str = self._format_ist(dt_utc)
         
-        if self.historical_predictions.empty or bar not in self.historical_predictions.index:
-            new_pred = pd.DataFrame({"Close": price, "Long_Prob": pl, "Short_Prob": ps}, index=[bar])
-            if self.historical_predictions.empty: self.historical_predictions = new_pred
-            else: self.historical_predictions = pd.concat([self.historical_predictions, new_pred])
-            self.historical_predictions = self.historical_predictions.tail(2000) 
-            
-        result = {
-            "timestamp":        ist_iso, "bar_time": ist_iso,
-            "open": round(float(r["Open"]), 2), "high": round(float(r["High"]), 2), "low": round(float(r["Low"]), 2), "close": round(price, 2), "price": round(price, 2),
-            "prob_long": round(pl * 100, 1), "prob_short": round(ps * 100, 1),
-            "signal": signal, "long_thresh_pct": round(self.long_thresh * 100), "short_thresh_pct": round(self.short_thresh * 100),
-            "rsi_2m": round(float(fm["2m_RSI"].iloc[-1]), 1), "adx_2m": round(float(fm["2m_ADX"].iloc[-1]), 1), "ma_bull_2m": int(fm["2m_MA_Bull"].iloc[-1]),
-            "h4_15m": round(float(r["15m_H4"]), 2), "l4_15m": round(float(r["15m_L4"]), 2),
-            "h4_60m": round(float(r["60m_H4"]), 2), "l4_60m": round(float(r["60m_L4"]), 2),
-            "macd": round(float(r["2m_MACD"]), 2), "macd_hist": round(float(r["2m_Hist"]), 2), "macd_signal": round(float(r["2m_Signal"]), 2),
-            "data_source": self.data_mgr.current_source, "eval_mode": self.eval_mode
+        res = {
+            "time": ist_str, "unix": unix_sec,
+            "open": float(r1["Open"]), "high": float(r1["High"]), "low": float(r1["Low"]), "close": price, "price": price,
+            "prob_long_m1": round(pl1*100, 1), "prob_short_m1": round(ps1*100, 1),
+            "prob_long_m2": round(pl2*100, 1), "prob_short_m2": round(ps2*100, 1),
+            "h4_15m": float(r1["15m_H4"]), "l4_15m": float(r1["15m_L4"]),
+            "h4_60m": float(r1["60m_H4"]), "l4_60m": float(r1["60m_L4"]),
+            "macd": float(r1["2m_MACD"]), "macd_hist": float(r1["2m_Hist"]), "macd_signal": float(r1["2m_Signal"]),
+            "adx_2m": float(r1["2m_ADX"]), "rsi_2m": float(r1["2m_RSI"]), "ma_bull_2m": float(r1["2m_MA_Bull"]),
+            "data_source": self.data_mgr.current_source
         }
         
-        self.signal_history.appendleft(result)
-        self.latest_signal = result
-        return result
+        if self.historical_predictions.empty or unix_sec not in self.historical_predictions['unix'].values:
+            df_new = pd.DataFrame([res])
+            if self.historical_predictions.empty: self.historical_predictions = df_new
+            else: self.historical_predictions = pd.concat([self.historical_predictions, df_new]).tail(5000)
+            
+        self.signal_history.appendleft(res)
+        self.latest_signal = res
+        return res
 
 
-app    = FastAPI(title="Nifty Sniper API v2")
+app    = FastAPI(title="Nifty Sniper API v3")
 engine = NiftySignalEngine()
 clients: dict[str, set[WebSocket]] = {}   
 
@@ -371,28 +362,33 @@ async def switch_data_source(body: DataSourceSwitch, admin: dict = Depends(requi
 
 @app.get("/admin/stats")
 async def admin_stats(admin: dict = Depends(require_admin)):
-    return {"connected_users": sum(len(v) for v in clients.values()), "signal_count": len(engine.signal_history), "latest_signal": engine.latest_signal, "data_source": engine.data_mgr.status, "eval_mode": engine.eval_mode, "thresholds": {"long": round(engine.long_thresh * 100), "short": round(engine.short_thresh * 100)}}
+    return {
+        "connected_users": sum(len(v) for v in clients.values()), 
+        "signal_count": len(engine.signal_history), 
+        "latest_signal": engine.latest_signal, 
+        "data_source": engine.data_mgr.status, 
+        "settings": engine.settings
+    }
 
 @app.get("/admin/history")
 async def get_historical_signals(days_back: int = 1, admin: dict = Depends(require_admin)):
     df = engine.historical_predictions
     if df is None or df.empty: raise HTTPException(status_code=400, detail="Engine empty.")
     try:
-        df = df.between_time('09:15', '15:30')
+        # Sort values properly
+        df = df.sort_values('unix')
+        
+        # We don't filter `between_time` here so that full Candlestick continuity works.
+        # Lightweight charts handles time gaps automatically.
         if days_back > 0:
-            start_date = df.index[-1].date() - timedelta(days=days_back)
-            df = df.loc[str(start_date):]
+            start_unix = df['unix'].iloc[-1] - (days_back * 86400)
+            df = df[df['unix'] >= start_unix]
 
-        history_list = []
-        for index, row in df.iterrows():
-            history_list.append({
-                "time": engine._format_ist(index),
-                "open": round(row.get("Open", 0), 2), "high": round(row.get("High", 0), 2), "low": round(row.get("Low", 0), 2), "close": round(row.get("Close", 0), 2), "price": round(row.get("Close", 0), 2),
-                "long_prob": round(row.get("Long_Prob", 0) * 100, 1), "short_prob": round(row.get("Short_Prob", 0) * 100, 1),
-                "h4_15m": round(row.get("H4_15m", 0), 2), "l4_15m": round(row.get("L4_15m", 0), 2), "h4_60m": round(row.get("H4_60m", 0), 2), "l4_60m": round(row.get("L4_60m", 0), 2),
-            })
+        history_list = df.to_dict('records')
         return {"status": "ok", "records": len(history_list), "data": history_list}
-    except: raise HTTPException(status_code=500, detail="History error")
+    except Exception as e:
+        log.error(e)
+        raise HTTPException(status_code=500, detail="History error")
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, token: str = Query(...)):
@@ -412,6 +408,7 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...)):
     if engine.latest_signal: await ws.send_text(json.dumps({"type": "signal",  "data": engine.latest_signal}))
     if engine.signal_history: await ws.send_text(json.dumps({"type": "history", "data": list(engine.signal_history)}))
     await ws.send_text(json.dumps({"type": "data_source", "data": engine.data_mgr.status}))
+    await ws.send_text(json.dumps({"type": "settings_update", "data": engine.settings}))
 
     try:
         while True:
@@ -419,21 +416,11 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...)):
             if raw in ("ping", ""): continue
             try:
                 msg = json.loads(raw)
-                if msg.get("type") == "set_threshold" and user["role"] == "admin":
-                    lt = max(0.50, min(0.99, float(msg.get("long",  engine.long_thresh))))
-                    st = max(0.50, min(0.99, float(msg.get("short", engine.short_thresh))))
-                    engine.long_thresh, engine.short_thresh = lt, st
-                    if engine.latest_signal: await broadcast({"type": "signal", "data": engine._apply_threshold(engine.latest_signal)})
-                
-                # LISTENER FOR MODE TOGGLE
-                if msg.get("type") == "set_eval_mode" and user["role"] == "admin":
-                    new_mode = int(msg.get("mode", 1))
-                    if engine.eval_mode != new_mode:
-                        engine.eval_mode = new_mode
-                        log.info(f"Admin switched to Mode {new_mode}. Recalculating charts...")
-                        engine._warmup_and_backtest()
-                        await broadcast({"type": "history", "data": list(engine.signal_history)})
-                        await broadcast({"type": "eval_mode_changed", "mode": new_mode})
+                if msg.get("type") == "update_settings" and user["role"] == "admin":
+                    new_settings = msg.get("data", {})
+                    engine.settings.update(new_settings)
+                    log.info(f"Admin applied new engine settings.")
+                    await broadcast({"type": "settings_update", "data": engine.settings})
             except: pass
     except WebSocketDisconnect:
         clients.get(username, set()).discard(ws)
